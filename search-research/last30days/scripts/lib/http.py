@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 from . import __version__
 from . import log as _log
+from .env import _resolve_aisa_api_key
 
 DEFAULT_TIMEOUT = 30
 
@@ -219,7 +220,7 @@ def _inject_aisa_headers(url: str, headers: Dict[str, str], has_json_body: bool)
         return
     api_key = (
         headers.get("Authorization", "").removeprefix("Bearer ").strip()
-        or os.environ.get("AISA_API_KEY", "").strip()
+        or _resolve_aisa_api_key()
     )
     if not api_key:
         raise HTTPError("AISA_API_KEY is required for requests to api.aisa.one")

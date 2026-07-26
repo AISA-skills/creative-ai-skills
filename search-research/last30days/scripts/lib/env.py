@@ -22,6 +22,67 @@ else:
     CONFIG_DIR = Path.home() / ".config" / "last30days"
     CONFIG_FILE = CONFIG_DIR / ".env"
 
+def _resolve_aisa_api_key() -> str:
+    """Resolve AISA_API_KEY from the environment, then from known credential files.
+
+    Hermes scrubs environment variables whose name contains "KEY" before it
+    spawns a skill subprocess, so os.environ alone is not enough there. It does
+    pass HERMES_HOME / HERMES_PROFILE through, which locates the active profile.
+
+    Order: env -> ~/.aisa/credentials
+           -> $HERMES_HOME/profiles/$HERMES_PROFILE/.env -> $HERMES_HOME/.env
+
+    Only the *running* profile's file is read, never a sibling profile's, so a
+    machine hosting several profiles cannot leak one profile's key into another.
+    Returns "" when nothing is found; never raises on an unreadable or
+    undecodable file.
+    """
+    key = os.environ.get("AISA_API_KEY", "").strip()
+    if key:
+        return key
+
+    home = os.path.expanduser("~")
+    hermes_home = os.environ.get("HERMES_HOME") or os.path.join(home, ".hermes")
+
+    candidates = [os.path.join(home, ".aisa", "credentials")]
+    profile = os.environ.get("HERMES_PROFILE", "").strip()
+    if profile:
+        candidates.append(os.path.join(hermes_home, "profiles", profile, ".env"))
+    candidates.append(os.path.join(hermes_home, ".env"))
+
+    for path in candidates:
+        try:
+            # utf-8-sig drops a BOM; errors="replace" keeps a mis-encoded file
+            # from raising UnicodeDecodeError (a ValueError, not an OSError).
+            with open(path, encoding="utf-8-sig", errors="replace") as handle:
+                lines = handle.readlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            name, sep, value = line.partition("=")
+            if not sep or name.strip() != "AISA_API_KEY":
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            else:
+                for marker in (" #", "\t#"):
+                    if marker in value:
+                        value = value.split(marker, 1)[0]
+                value = value.strip()
+            # U+FFFD only appears where bytes failed to decode, so the value is
+            # corrupt and cannot be a real key — keep looking rather than send
+            # garbage as a bearer token.
+            if value and "�" not in value:
+                return value
+    return ""
+
+
 def _check_file_permissions(path: Path) -> None:
     """Warn to stderr if a secrets file has overly permissive permissions."""
     try:
@@ -98,7 +159,8 @@ def get_config() -> dict[str, Any]:
 
     # Build config: process.env > project .env > global .env
     config = {
-        'AISA_API_KEY': os.environ.get('AISA_API_KEY') or merged_env.get('AISA_API_KEY'),
+        'AISA_API_KEY': (os.environ.get('AISA_API_KEY') or merged_env.get('AISA_API_KEY')
+                         or _resolve_aisa_api_key() or None),
         'AISA_BASE_URL': os.environ.get('AISA_BASE_URL') or merged_env.get('AISA_BASE_URL', 'https://api.aisa.one'),
         'GITHUB_TOKEN': (
             os.environ.get('GITHUB_TOKEN')

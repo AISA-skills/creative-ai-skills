@@ -39,6 +39,67 @@ class RelayConfigError(ValueError):
     """Configuration is incomplete or invalid."""
 
 
+def _resolve_aisa_api_key() -> str:
+    """Resolve AISA_API_KEY from the environment, then from known credential files.
+
+    Hermes scrubs environment variables whose name contains "KEY" before it
+    spawns a skill subprocess, so os.environ alone is not enough there. It does
+    pass HERMES_HOME / HERMES_PROFILE through, which locates the active profile.
+
+    Order: env -> ~/.aisa/credentials
+           -> $HERMES_HOME/profiles/$HERMES_PROFILE/.env -> $HERMES_HOME/.env
+
+    Only the *running* profile's file is read, never a sibling profile's, so a
+    machine hosting several profiles cannot leak one profile's key into another.
+    Returns "" when nothing is found; never raises on an unreadable or
+    undecodable file.
+    """
+    key = os.environ.get("AISA_API_KEY", "").strip()
+    if key:
+        return key
+
+    home = os.path.expanduser("~")
+    hermes_home = os.environ.get("HERMES_HOME") or os.path.join(home, ".hermes")
+
+    candidates = [os.path.join(home, ".aisa", "credentials")]
+    profile = os.environ.get("HERMES_PROFILE", "").strip()
+    if profile:
+        candidates.append(os.path.join(hermes_home, "profiles", profile, ".env"))
+    candidates.append(os.path.join(hermes_home, ".env"))
+
+    for path in candidates:
+        try:
+            # utf-8-sig drops a BOM; errors="replace" keeps a mis-encoded file
+            # from raising UnicodeDecodeError (a ValueError, not an OSError).
+            with open(path, encoding="utf-8-sig", errors="replace") as handle:
+                lines = handle.readlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            name, sep, value = line.partition("=")
+            if not sep or name.strip() != "AISA_API_KEY":
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            else:
+                for marker in (" #", "\t#"):
+                    if marker in value:
+                        value = value.split(marker, 1)[0]
+                value = value.strip()
+            # U+FFFD only appears where bytes failed to decode, so the value is
+            # corrupt and cannot be a real key — keep looking rather than send
+            # garbage as a bearer token.
+            if value and "�" not in value:
+                return value
+    return ""
+
+
 def get_env(name: str, default: Optional[str] = None) -> Optional[str]:
     return os.environ.get(name, default)
 
@@ -55,7 +116,7 @@ def normalize_base_url(base_url: str) -> str:
 
 def load_config(args: argparse.Namespace) -> Dict[str, Any]:
     base_url = normalize_base_url(DEFAULT_BASE_URL)
-    aisa_api_key = get_env("AISA_API_KEY")
+    aisa_api_key = _resolve_aisa_api_key()
     timeout = DEFAULT_TIMEOUT
 
     if not aisa_api_key:
