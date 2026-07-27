@@ -628,7 +628,12 @@ Examples:
             print(output)
         except UnicodeEncodeError:
             print(json.dumps(result, indent=2, ensure_ascii=True))
-        sys.exit(0 if result.get("success", True) else 1)
+        # Endpoints returning a bare JSON array (polymarket markets, kalshi
+        # markets, ...) carry no "success" envelope, and .get() on a list
+        # raises AttributeError — the data printed fine but the process died
+        # with a traceback and exit 1. Only a dict can report failure.
+        failed = isinstance(result, dict) and not result.get("success", True)
+        sys.exit(1 if failed else 0)
 
 
 if __name__ == "__main__":
