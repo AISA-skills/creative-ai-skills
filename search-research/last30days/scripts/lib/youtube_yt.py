@@ -31,8 +31,7 @@ TRANSCRIPT_LIMITS = {
 # Max words to keep from each transcript
 TRANSCRIPT_MAX_WORDS = 5000
 
-from . import aisa
-from . import env, http, log
+from . import aisa, env, http, log
 from .relevance import token_overlap_relevance as _compute_relevance
 
 
@@ -207,8 +206,9 @@ def search_youtube(
         Dict with 'items' list of video metadata dicts.
     """
     del to_date
-    # Not os.environ: hermes scrubs AISA_API_KEY from skill subprocesses, and
-    # returning "not configured" here silently drops YouTube from the run.
+    # Not os.environ: a harness that scrubs the environment (or a plugin
+    # install with no profile .env) leaves this empty, and returning
+    # "not configured" here silently drops YouTube from the whole run.
     api_key = env.get_config().get("AISA_API_KEY") or ""
     if not api_key:
         return {"items": [], "error": "AISA_API_KEY not configured"}

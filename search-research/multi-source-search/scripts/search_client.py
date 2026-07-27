@@ -30,17 +30,29 @@ from typing import Any, Dict, List, Optional
 def _resolve_aisa_api_key() -> str:
     """Resolve AISA_API_KEY from the environment, then from known credential files.
 
-    Hermes scrubs environment variables whose name contains "KEY" before it
-    spawns a skill subprocess, so os.environ alone is not enough there. It does
-    pass HERMES_HOME / HERMES_PROFILE through, which locates the active profile.
+    os.environ is not always populated. The plugin / OpenClaw install form has no
+    profile .env to inherit from, and hermes' sandboxed code-execution path
+    strips variables whose name contains "KEY". `~/.aisa/credentials` is the
+    cross-harness convention AgentSpec already documents for exactly this case
+    (plugin-core/inject.ts: "scripts resolve these as: env var ->
+    ~/.aisa/credentials").
 
     Order: env -> ~/.aisa/credentials
-           -> $HERMES_HOME/profiles/$HERMES_PROFILE/.env -> $HERMES_HOME/.env
+           -> $HERMES_HOME/profiles/$HERMES_PROFILE/.env (when HERMES_PROFILE is set)
+           -> $HERMES_HOME/.env
 
-    Only the *running* profile's file is read, never a sibling profile's, so a
-    machine hosting several profiles cannot leak one profile's key into another.
+    Under `hermes --profile X`, HERMES_HOME *is* the profile directory and
+    HERMES_PROFILE is unset, so the last candidate resolves to that profile's own
+    .env; the middle one covers harnesses that identify the profile by name
+    instead. Only the running profile is ever read, never a sibling's, so a host
+    with several profiles cannot hand back the wrong tenant's key.
+
     Returns "" when nothing is found; never raises on an unreadable or
     undecodable file.
+
+    Kept byte-identical across the AIsa skills that need it —
+    financial/marketpulse/scripts/market_client.py is the canonical copy; change
+    it there first, then propagate.
     """
     key = os.environ.get("AISA_API_KEY", "").strip()
     if key:
@@ -73,8 +85,13 @@ def _resolve_aisa_api_key() -> str:
             if not sep or name.strip() != "AISA_API_KEY":
                 continue
             value = value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-                value = value[1:-1]
+            if value[:1] in ("'", '"'):
+                # A quoted value ends at its closing quote; whatever follows is
+                # a trailing comment, not part of the secret. Checking "starts
+                # and ends with a quote" instead would miss `KEY="v" # note`
+                # and hand back the value with its quotes still attached.
+                end = value.find(value[0], 1)
+                value = value[1:end] if end != -1 else value[1:]
             else:
                 for marker in (" #", "\t#"):
                     if marker in value:
@@ -97,7 +114,8 @@ class SearchClient:
         self.api_key = api_key or _resolve_aisa_api_key()
         if not self.api_key:
             raise ValueError(
-                "AISA_API_KEY is required. Set it via environment variable or pass to constructor."
+                "AISA_API_KEY is required. Set the environment variable, add\n"
+                "AISA_API_KEY=<key> to ~/.aisa/credentials, or pass it to the constructor."
             )
 
     def _request(

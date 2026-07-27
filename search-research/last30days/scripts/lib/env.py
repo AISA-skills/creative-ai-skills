@@ -25,23 +25,37 @@ else:
 def _resolve_from_files(name: str) -> str:
     """Resolve a setting from the environment, then from known AIsa config files.
 
-    Hermes scrubs almost every environment variable before it spawns a skill
-    subprocess — anything whose name contains "KEY"/"TOKEN"/... outright, and
-    everything else that does not match a short safe-prefix allowlist (PATH,
-    HOME, LC_, XDG_, ...). AISA_API_KEY and AISA_MODEL are both dropped. It does
-    pass HERMES_HOME / HERMES_PROFILE through, which locates the active profile.
+    os.environ is not always populated. The plugin / OpenClaw install form has no
+    profile .env to inherit from, and hermes' sandboxed code-execution path
+    strips variables whose name contains "KEY"/"TOKEN"/... `~/.aisa/credentials`
+    is the cross-harness convention AgentSpec documents for exactly this case.
+
+    Applies to the model pins as much as the key: without a pin,
+    providers._resolve_model_pins raises and the run dies, and the only
+    documented recovery (`last30days setup`) is interactive.
 
     Order: env -> ~/.aisa/credentials
-           -> $HERMES_HOME/profiles/$HERMES_PROFILE/.env -> $HERMES_HOME/.env
+           -> $HERMES_HOME/profiles/$HERMES_PROFILE/.env (when HERMES_PROFILE is set)
+           -> $HERMES_HOME/.env
 
-    Only the *running* profile's file is read, never a sibling profile's, so a
-    machine hosting several profiles cannot leak one profile's settings into
-    another. Returns "" when nothing is found; never raises on an unreadable or
-    undecodable file.
+    Under `hermes --profile X`, HERMES_HOME *is* the profile directory and
+    HERMES_PROFILE is unset, so the last candidate resolves to that profile's own
+    .env. Only the running profile is ever read, never a sibling's.
+
+    Returns "" when nothing is found, when clean mode is active
+    (LAST30DAYS_CONFIG_DIR=""), or when a file is unreadable — never raises.
     """
     value = os.environ.get(name, "").strip()
     if value:
         return value
+
+    # LAST30DAYS_CONFIG_DIR="" is clean mode: the caller has built a deliberately
+    # minimal environment and expects nothing to be picked up off disk.
+    # evaluate_search_quality's create_eval_env() relies on that to compare two
+    # revisions hermetically — reading the operator's model pin from
+    # ~/.aisa/credentials there would silently change what is being measured.
+    if CONFIG_FILE is None:
+        return ""
 
     home = os.path.expanduser("~")
     hermes_home = os.environ.get("HERMES_HOME") or os.path.join(home, ".hermes")
@@ -70,8 +84,13 @@ def _resolve_from_files(name: str) -> str:
             if not sep or key.strip() != name:
                 continue
             val = val.strip()
-            if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
-                val = val[1:-1]
+            if val[:1] in ("'", '"'):
+                # A quoted value ends at its closing quote; whatever follows is
+                # a trailing comment, not part of the secret. Checking "starts
+                # and ends with a quote" instead would miss `KEY="v" # note`
+                # and hand back the value with its quotes still attached.
+                end = val.find(val[0], 1)
+                val = val[1:end] if end != -1 else val[1:]
             else:
                 for marker in (" #", "\t#"):
                     if marker in val:
