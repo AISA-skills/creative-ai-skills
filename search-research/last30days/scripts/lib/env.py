@@ -289,7 +289,7 @@ def is_polymarket_available() -> bool:
 
     AISA is required for the hosted Polymarket integration.
     """
-    return bool(os.environ.get("AISA_API_KEY"))
+    return bool(get_config().get("AISA_API_KEY"))
 
 
 def is_tiktok_available(config: dict[str, Any]) -> bool:
