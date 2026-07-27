@@ -22,24 +22,26 @@ else:
     CONFIG_DIR = Path.home() / ".config" / "last30days"
     CONFIG_FILE = CONFIG_DIR / ".env"
 
-def _resolve_aisa_api_key() -> str:
-    """Resolve AISA_API_KEY from the environment, then from known credential files.
+def _resolve_from_files(name: str) -> str:
+    """Resolve a setting from the environment, then from known AIsa config files.
 
-    Hermes scrubs environment variables whose name contains "KEY" before it
-    spawns a skill subprocess, so os.environ alone is not enough there. It does
+    Hermes scrubs almost every environment variable before it spawns a skill
+    subprocess — anything whose name contains "KEY"/"TOKEN"/... outright, and
+    everything else that does not match a short safe-prefix allowlist (PATH,
+    HOME, LC_, XDG_, ...). AISA_API_KEY and AISA_MODEL are both dropped. It does
     pass HERMES_HOME / HERMES_PROFILE through, which locates the active profile.
 
     Order: env -> ~/.aisa/credentials
            -> $HERMES_HOME/profiles/$HERMES_PROFILE/.env -> $HERMES_HOME/.env
 
     Only the *running* profile's file is read, never a sibling profile's, so a
-    machine hosting several profiles cannot leak one profile's key into another.
-    Returns "" when nothing is found; never raises on an unreadable or
+    machine hosting several profiles cannot leak one profile's settings into
+    another. Returns "" when nothing is found; never raises on an unreadable or
     undecodable file.
     """
-    key = os.environ.get("AISA_API_KEY", "").strip()
-    if key:
-        return key
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
 
     home = os.path.expanduser("~")
     hermes_home = os.environ.get("HERMES_HOME") or os.path.join(home, ".hermes")
@@ -64,23 +66,28 @@ def _resolve_aisa_api_key() -> str:
                 continue
             if line.startswith("export "):
                 line = line[len("export "):].lstrip()
-            name, sep, value = line.partition("=")
-            if not sep or name.strip() != "AISA_API_KEY":
+            key, sep, val = line.partition("=")
+            if not sep or key.strip() != name:
                 continue
-            value = value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-                value = value[1:-1]
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                val = val[1:-1]
             else:
                 for marker in (" #", "\t#"):
-                    if marker in value:
-                        value = value.split(marker, 1)[0]
-                value = value.strip()
+                    if marker in val:
+                        val = val.split(marker, 1)[0]
+                val = val.strip()
             # U+FFFD only appears where bytes failed to decode, so the value is
-            # corrupt and cannot be a real key — keep looking rather than send
-            # garbage as a bearer token.
-            if value and "�" not in value:
-                return value
+            # corrupt and cannot be a real setting — keep looking rather than
+            # send garbage as a bearer token or a model id.
+            if val and "�" not in val:
+                return val
     return ""
+
+
+def _resolve_aisa_api_key() -> str:
+    """Back-compat alias — lib/http.py imports this name."""
+    return _resolve_from_files("AISA_API_KEY")
 
 
 def _check_file_permissions(path: Path) -> None:
@@ -160,7 +167,7 @@ def get_config() -> dict[str, Any]:
     # Build config: process.env > project .env > global .env
     config = {
         'AISA_API_KEY': (os.environ.get('AISA_API_KEY') or merged_env.get('AISA_API_KEY')
-                         or _resolve_aisa_api_key() or None),
+                         or _resolve_from_files('AISA_API_KEY') or None),
         'AISA_BASE_URL': os.environ.get('AISA_BASE_URL') or merged_env.get('AISA_BASE_URL', 'https://api.aisa.one'),
         'GITHUB_TOKEN': (
             os.environ.get('GITHUB_TOKEN')
@@ -184,8 +191,21 @@ def get_config() -> dict[str, Any]:
         ('LAST30DAYS_REDDIT_COMMENTS', None),
     ]
 
+    # Settings that also fall back to the AIsa config files. Under a harness
+    # that scrubs the environment (hermes), os.environ is empty for all of
+    # these, and the model pins are as load-bearing as the key: without one,
+    # providers._resolve_model_pins raises and the whole run dies.
+    FILE_BACKED = {
+        'AISA_MODEL',
+        'LAST30DAYS_PLANNER_MODEL',
+        'LAST30DAYS_RERANK_MODEL',
+        'LAST30DAYS_FUN_MODEL',
+    }
     for key, default in keys:
-        config[key] = os.environ.get(key) or merged_env.get(key, default)
+        value = os.environ.get(key) or merged_env.get(key)
+        if not value and key in FILE_BACKED:
+            value = _resolve_from_files(key)
+        config[key] = value or default
 
     # Track which config source was used
     if project_env_path:
