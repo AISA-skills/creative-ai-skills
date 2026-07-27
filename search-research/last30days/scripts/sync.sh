@@ -10,7 +10,7 @@ fi
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="$1"
-PYTHON="$("$SRC/scripts/dev-python.sh")"
+PYTHON="$(bash "$SRC/scripts/dev-python.sh")"
 
 mkdir -p "$TARGET/scripts/lib"
 cp "$SRC/SKILL.md" "$TARGET/SKILL.md"

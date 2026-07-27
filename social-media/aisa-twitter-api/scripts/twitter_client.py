@@ -29,6 +29,84 @@ TWITTER_URL_WEIGHT = 23
 URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
 
 
+def _resolve_aisa_api_key() -> str:
+    """Resolve AISA_API_KEY from the environment, then from known credential files.
+
+    os.environ is not always populated. The plugin / OpenClaw install form has no
+    profile .env to inherit from, and hermes' sandboxed code-execution path
+    strips variables whose name contains "KEY". `~/.aisa/credentials` is the
+    cross-harness convention AgentSpec already documents for exactly this case
+    (plugin-core/inject.ts: "scripts resolve these as: env var ->
+    ~/.aisa/credentials").
+
+    Order: env -> ~/.aisa/credentials
+           -> $HERMES_HOME/profiles/$HERMES_PROFILE/.env (when HERMES_PROFILE is set)
+           -> $HERMES_HOME/.env
+
+    Under `hermes --profile X`, HERMES_HOME *is* the profile directory and
+    HERMES_PROFILE is unset, so the last candidate resolves to that profile's own
+    .env; the middle one covers harnesses that identify the profile by name
+    instead. Only the running profile is ever read, never a sibling's, so a host
+    with several profiles cannot hand back the wrong tenant's key.
+
+    Returns "" when nothing is found; never raises on an unreadable or
+    undecodable file.
+
+    Kept byte-identical across the AIsa skills that need it —
+    financial/marketpulse/scripts/market_client.py is the canonical copy; change
+    it there first, then propagate.
+    """
+    key = os.environ.get("AISA_API_KEY", "").strip()
+    if key:
+        return key
+
+    home = os.path.expanduser("~")
+    hermes_home = os.environ.get("HERMES_HOME") or os.path.join(home, ".hermes")
+
+    candidates = [os.path.join(home, ".aisa", "credentials")]
+    profile = os.environ.get("HERMES_PROFILE", "").strip()
+    if profile:
+        candidates.append(os.path.join(hermes_home, "profiles", profile, ".env"))
+    candidates.append(os.path.join(hermes_home, ".env"))
+
+    for path in candidates:
+        try:
+            # utf-8-sig drops a BOM; errors="replace" keeps a mis-encoded file
+            # from raising UnicodeDecodeError (a ValueError, not an OSError).
+            with open(path, encoding="utf-8-sig", errors="replace") as handle:
+                lines = handle.readlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            name, sep, value = line.partition("=")
+            if not sep or name.strip() != "AISA_API_KEY":
+                continue
+            value = value.strip()
+            if value[:1] in ("'", '"'):
+                # A quoted value ends at its closing quote; whatever follows is
+                # a trailing comment, not part of the secret. Checking "starts
+                # and ends with a quote" instead would miss `KEY="v" # note`
+                # and hand back the value with its quotes still attached.
+                end = value.find(value[0], 1)
+                value = value[1:end] if end != -1 else value[1:]
+            else:
+                for marker in (" #", "\t#"):
+                    if marker in value:
+                        value = value.split(marker, 1)[0]
+                value = value.strip()
+            # U+FFFD only appears where bytes failed to decode, so the value is
+            # corrupt and cannot be a real key — keep looking rather than send
+            # garbage as a bearer token.
+            if value and "�" not in value:
+                return value
+    return ""
+
+
 class TwitterClient:
     """OpenClaw Twitter - Twitter/X API Client."""
 
@@ -36,10 +114,11 @@ class TwitterClient:
 
     def __init__(self, api_key: Optional[str] = None):
         """Initialize the client with an API key."""
-        self.api_key = api_key or os.environ.get("AISA_API_KEY")
+        self.api_key = api_key or _resolve_aisa_api_key()
         if not self.api_key:
             raise ValueError(
-                "AISA_API_KEY is required. Set it via environment variable."
+                "AISA_API_KEY is required. Set the environment variable or add\n"
+                "AISA_API_KEY=<key> to ~/.aisa/credentials."
             )
 
     def _request(

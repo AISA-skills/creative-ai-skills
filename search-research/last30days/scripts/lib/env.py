@@ -22,6 +22,93 @@ else:
     CONFIG_DIR = Path.home() / ".config" / "last30days"
     CONFIG_FILE = CONFIG_DIR / ".env"
 
+def _resolve_from_files(name: str) -> str:
+    """Resolve a setting from the environment, then from known AIsa config files.
+
+    os.environ is not always populated. The plugin / OpenClaw install form has no
+    profile .env to inherit from, and hermes' sandboxed code-execution path
+    strips variables whose name contains "KEY"/"TOKEN"/... `~/.aisa/credentials`
+    is the cross-harness convention AgentSpec documents for exactly this case.
+
+    Applies to the model pins as much as the key: without a pin,
+    providers._resolve_model_pins raises and the run dies, and the only
+    documented recovery (`last30days setup`) is interactive.
+
+    Order: env -> ~/.aisa/credentials
+           -> $HERMES_HOME/profiles/$HERMES_PROFILE/.env (when HERMES_PROFILE is set)
+           -> $HERMES_HOME/.env
+
+    Under `hermes --profile X`, HERMES_HOME *is* the profile directory and
+    HERMES_PROFILE is unset, so the last candidate resolves to that profile's own
+    .env. Only the running profile is ever read, never a sibling's.
+
+    Returns "" when nothing is found, when clean mode is active
+    (LAST30DAYS_CONFIG_DIR=""), or when a file is unreadable — never raises.
+    """
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+
+    # LAST30DAYS_CONFIG_DIR="" is clean mode: the caller has built a deliberately
+    # minimal environment and expects nothing to be picked up off disk.
+    # evaluate_search_quality's create_eval_env() relies on that to compare two
+    # revisions hermetically — reading the operator's model pin from
+    # ~/.aisa/credentials there would silently change what is being measured.
+    if CONFIG_FILE is None:
+        return ""
+
+    home = os.path.expanduser("~")
+    hermes_home = os.environ.get("HERMES_HOME") or os.path.join(home, ".hermes")
+
+    candidates = [os.path.join(home, ".aisa", "credentials")]
+    profile = os.environ.get("HERMES_PROFILE", "").strip()
+    if profile:
+        candidates.append(os.path.join(hermes_home, "profiles", profile, ".env"))
+    candidates.append(os.path.join(hermes_home, ".env"))
+
+    for path in candidates:
+        try:
+            # utf-8-sig drops a BOM; errors="replace" keeps a mis-encoded file
+            # from raising UnicodeDecodeError (a ValueError, not an OSError).
+            with open(path, encoding="utf-8-sig", errors="replace") as handle:
+                lines = handle.readlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            key, sep, val = line.partition("=")
+            if not sep or key.strip() != name:
+                continue
+            val = val.strip()
+            if val[:1] in ("'", '"'):
+                # A quoted value ends at its closing quote; whatever follows is
+                # a trailing comment, not part of the secret. Checking "starts
+                # and ends with a quote" instead would miss `KEY="v" # note`
+                # and hand back the value with its quotes still attached.
+                end = val.find(val[0], 1)
+                val = val[1:end] if end != -1 else val[1:]
+            else:
+                for marker in (" #", "\t#"):
+                    if marker in val:
+                        val = val.split(marker, 1)[0]
+                val = val.strip()
+            # U+FFFD only appears where bytes failed to decode, so the value is
+            # corrupt and cannot be a real setting — keep looking rather than
+            # send garbage as a bearer token or a model id.
+            if val and "�" not in val:
+                return val
+    return ""
+
+
+def _resolve_aisa_api_key() -> str:
+    """Back-compat alias — lib/http.py imports this name."""
+    return _resolve_from_files("AISA_API_KEY")
+
+
 def _check_file_permissions(path: Path) -> None:
     """Warn to stderr if a secrets file has overly permissive permissions."""
     try:
@@ -98,7 +185,8 @@ def get_config() -> dict[str, Any]:
 
     # Build config: process.env > project .env > global .env
     config = {
-        'AISA_API_KEY': os.environ.get('AISA_API_KEY') or merged_env.get('AISA_API_KEY'),
+        'AISA_API_KEY': (os.environ.get('AISA_API_KEY') or merged_env.get('AISA_API_KEY')
+                         or _resolve_from_files('AISA_API_KEY') or None),
         'AISA_BASE_URL': os.environ.get('AISA_BASE_URL') or merged_env.get('AISA_BASE_URL', 'https://api.aisa.one'),
         'GITHUB_TOKEN': (
             os.environ.get('GITHUB_TOKEN')
@@ -122,8 +210,21 @@ def get_config() -> dict[str, Any]:
         ('LAST30DAYS_REDDIT_COMMENTS', None),
     ]
 
+    # Settings that also fall back to the AIsa config files. Under a harness
+    # that scrubs the environment (hermes), os.environ is empty for all of
+    # these, and the model pins are as load-bearing as the key: without one,
+    # providers._resolve_model_pins raises and the whole run dies.
+    FILE_BACKED = {
+        'AISA_MODEL',
+        'LAST30DAYS_PLANNER_MODEL',
+        'LAST30DAYS_RERANK_MODEL',
+        'LAST30DAYS_FUN_MODEL',
+    }
     for key, default in keys:
-        config[key] = os.environ.get(key) or merged_env.get(key, default)
+        value = os.environ.get(key) or merged_env.get(key)
+        if not value and key in FILE_BACKED:
+            value = _resolve_from_files(key)
+        config[key] = value or default
 
     # Track which config source was used
     if project_env_path:
@@ -207,7 +308,7 @@ def is_polymarket_available() -> bool:
 
     AISA is required for the hosted Polymarket integration.
     """
-    return bool(os.environ.get("AISA_API_KEY"))
+    return bool(get_config().get("AISA_API_KEY"))
 
 
 def is_tiktok_available(config: dict[str, Any]) -> bool:

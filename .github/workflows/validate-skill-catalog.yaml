@@ -49,11 +49,18 @@ jobs:
       - name: Run quality-gate unit tests
         run: .venv/bin/python .github/scripts/tests/test_catalog_quality.py -v
 
+      # The AISA credential resolver is duplicated byte-for-byte across several
+      # skills (a skill must be self-contained and cannot import across skill
+      # dirs). This asserts every copy still behaves identically.
+      - name: Run credential-resolution contract tests
+        run: .venv/bin/python .github/scripts/tests/test_credentials_resolution.py -v
+
       - name: Type-check quality-gate code
         run: >-
           .venv/bin/pyright
           .github/scripts/catalog_quality.py
           .github/scripts/tests/test_catalog_quality.py
+          .github/scripts/tests/test_credentials_resolution.py
 
       - name: Validate catalog changes
         env:
